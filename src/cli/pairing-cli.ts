@@ -3,14 +3,14 @@
 import process from 'process';
 
 import {
+  PairingEntry,
   PairingExpiredError,
   PairingNotFoundError,
-  PairingRequest,
   approvePairing,
   getPendingPairings,
   rejectPairing,
 } from '../telegram/pairing-store.js';
-import { addTelegramAllowEntry } from '../telegram/allowlist-store.js';
+import { addToAllowlist } from '../telegram/allowlist-store.js';
 
 const SUPPORTED_CHANNELS = ['telegram'] as const;
 type SupportedChannel = (typeof SUPPORTED_CHANNELS)[number];
@@ -41,13 +41,18 @@ function normalizeChannel(input?: string): SupportedChannel {
   );
 }
 
-function formatUser(entry: Pick<PairingRequest, 'firstName' | 'lastName'>): string {
-  const parts = [entry.firstName, entry.lastName].filter(Boolean);
-  return parts.length ? parts.join(' ') : 'Unknown';
+function formatUserLabel(entry: PairingEntry): string {
+  if (entry.username) {
+    return `@${entry.username}`;
+  }
+  return entry.userId || 'Unknown';
 }
 
-function renderPairingTable(channel: SupportedChannel): void {
-  const pairings = getPendingPairings(channel);
+async function renderPairingTable(channel: SupportedChannel): Promise<void> {
+  const pairings = await getPendingPairings();
+  if (channel !== 'telegram') {
+    throw new Error('Unsupported channel requested');
+  }
   if (pairings.length === 0) {
     console.log('No pending pairing requests.');
     return;
@@ -55,7 +60,7 @@ function renderPairingTable(channel: SupportedChannel): void {
 
   const rows = pairings.map((entry) => ({
     Code: entry.code,
-    User: formatUser(entry),
+    User: entry.userId,
     Username: entry.username ? `@${entry.username}` : '—',
     'Chat ID': entry.chatId,
     Expires: new Date(entry.expiresAt).toLocaleString(),
@@ -88,7 +93,7 @@ function handlePairingError(err: unknown, code?: string): never {
   process.exit(1);
 }
 
-function approveCommand(channel: SupportedChannel, code?: string): void {
+async function approveCommand(channel: SupportedChannel, code?: string): Promise<void> {
   if (!code) {
     console.error('Pairing approval requires a code.');
     usage();
@@ -96,27 +101,24 @@ function approveCommand(channel: SupportedChannel, code?: string): void {
   }
 
   try {
-    const pairing = approvePairing(code, channel);
+    const pairing = await approvePairing(code);
     if (channel === 'telegram') {
-      addTelegramAllowEntry({
-        userId: pairing.userId,
-        username: pairing.username,
-        firstName: pairing.firstName,
-        lastName: pairing.lastName,
-        chatId: pairing.chatId,
-      });
+      await addToAllowlist(pairing.userId);
+      if (pairing.username) {
+        await addToAllowlist(pairing.username);
+      }
     }
 
     const username = pairing.username ? ` (@${pairing.username})` : '';
     console.log(
-      `Approved ${channel} user ${formatUser(pairing)}${username}. Chat ID: ${pairing.chatId}.`,
+      `Approved ${channel} user ${formatUserLabel(pairing)}${username}. Chat ID: ${pairing.chatId}.`,
     );
   } catch (err) {
     handlePairingError(err, code);
   }
 }
 
-function rejectCommand(channel: SupportedChannel, code?: string): void {
+async function rejectCommand(channel: SupportedChannel, code?: string): Promise<void> {
   if (!code) {
     console.error('Pairing rejection requires a code.');
     usage();
@@ -124,14 +126,14 @@ function rejectCommand(channel: SupportedChannel, code?: string): void {
   }
 
   try {
-    rejectPairing(code, channel);
+    await rejectPairing(code);
     console.log(`Rejected ${channel} pairing request ${code.toUpperCase()}.`);
   } catch (err) {
     handlePairingError(err, code);
   }
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.length === 0) {
     usage();
@@ -157,13 +159,13 @@ function main(): void {
 
   switch (action) {
     case 'list':
-      renderPairingTable(channel);
+      await renderPairingTable(channel);
       break;
     case 'approve':
-      approveCommand(channel, code);
+      await approveCommand(channel, code);
       break;
     case 'reject':
-      rejectCommand(channel, code);
+      await rejectCommand(channel, code);
       break;
     default:
       console.error(`Unknown pairing subcommand "${action}".`);
@@ -172,4 +174,4 @@ function main(): void {
   }
 }
 
-main();
+void main();
