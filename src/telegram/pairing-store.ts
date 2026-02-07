@@ -254,6 +254,10 @@ async function acquireLock(): Promise<FileHandle> {
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
       if (err.code === 'EEXIST') {
+        if (await isLockFileStale()) {
+          await removeLockFile();
+          continue;
+        }
         if (Date.now() - start > LOCK_TIMEOUT_MS) {
           throw new Error('Timed out acquiring pairing store lock');
         }
@@ -273,16 +277,33 @@ async function releaseLock(handle: FileHandle): Promise<void> {
   try {
     await handle.close();
   } finally {
-    await fs.unlink(LOCK_FILE).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== 'ENOENT') {
-        throw error;
-      }
-    });
+    await removeLockFile();
   }
 }
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
+  });
+}
+
+async function isLockFileStale(): Promise<boolean> {
+  try {
+    const stats = await fs.stat(LOCK_FILE);
+    return Date.now() - stats.mtimeMs > LOCK_TIMEOUT_MS;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'ENOENT') {
+      return false;
+    }
+    throw err;
+  }
+}
+
+async function removeLockFile(): Promise<void> {
+  await fs.unlink(LOCK_FILE).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
   });
 }
