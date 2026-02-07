@@ -5,7 +5,7 @@ export type ConnectionState =
   | 'error';
 
 export interface ChannelSendOptions {
-  replyToMessageId?: number;
+  replyToMessageId?: number | string;
   threadId?: number;
   disableNotification?: boolean;
   parseMode?: 'HTML' | 'MarkdownV2' | 'None';
