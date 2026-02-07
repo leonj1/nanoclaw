@@ -384,12 +384,26 @@ export class TelegramChannel implements MessageChannel {
     threadId?: number,
   ) {
     const parseMode = options?.parseMode ?? 'HTML';
+    const replyId = this.normalizeReplyId(options?.replyToMessageId);
     return {
       parse_mode: parseMode === 'None' ? undefined : parseMode,
-      reply_to_message_id: options?.replyToMessageId,
+      reply_to_message_id: replyId,
       message_thread_id: options?.threadId ?? threadId,
       disable_notification: options?.disableNotification,
       disable_web_page_preview: options?.linkPreview === false || undefined,
     };
+  }
+
+  private normalizeReplyId(replyTo?: number | string): number | undefined {
+    if (typeof replyTo === 'number' && Number.isFinite(replyTo)) {
+      return replyTo;
+    }
+    if (typeof replyTo === 'string') {
+      const parsed = Number.parseInt(replyTo, 10);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+    return undefined;
   }
 }
