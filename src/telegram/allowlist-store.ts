@@ -1,221 +1,258 @@
-import { promises as fs } from 'fs';
+import fs from 'fs/promises';
 import path from 'path';
+import os from 'os';
 
-import { DATA_DIR } from '../config.js';
-import {
-  TelegramUserTarget,
-  buildChatMatchToken,
-  buildUserMatchTokens,
-  normalizeTelegramId,
-  normalizeUsername,
-} from './targets.js';
+const FILE_MODE = 0o600;
+const LOCK_RETRY_DELAY_MS = 50;
+const LOCK_TIMEOUT_MS = 5000;
+const CREDENTIALS_DIR = path.join(os.homedir(), '.nanoclaw', 'credentials');
+const ALLOWLIST_PATH = path.join(CREDENTIALS_DIR, 'telegram-allowFrom.json');
+const LOCK_PATH = path.join(CREDENTIALS_DIR, 'telegram-allowFrom.lock');
 
-const TELEGRAM_STATE_DIR = path.join(DATA_DIR, 'telegram');
-const ALLOWLIST_PATH = path.join(TELEGRAM_STATE_DIR, 'allowlist.json');
+export type AllowlistEntryType = 'id' | 'username' | 'wildcard';
 
-interface AllowlistData {
-  users: string[];
-  chats: string[];
+export interface AllowlistEntry {
+  type: AllowlistEntryType;
+  value: string;
 }
 
-interface TokenSet {
-  wildcard: boolean;
-  tokens: Set<string>;
+export async function loadAllowlist(): Promise<AllowlistEntry[]> {
+  return withFileLock(async () => readAllowlistFile());
 }
 
-/**
- * Check whether a DM sender is either statically allowed (config) or dynamically
- * allowlisted via the on-disk store.
- */
-export async function isAllowed(
-  target: TelegramUserTarget,
-  overrideEntries?: string[],
-): Promise<boolean> {
-  const tokens = buildUserMatchTokens(target.userId, target.username);
-  const configSet = buildUserTokenSet(overrideEntries);
-  if (configSet.wildcard) {
+export async function saveAllowlist(entries: AllowlistEntry[]): Promise<void> {
+  if (!Array.isArray(entries)) {
+    throw new Error('Allowlist entries must be an array');
+  }
+
+  const normalized = entries.map((entry) => normalizeExistingEntry(entry));
+
+  await withFileLock(async () => writeAllowlistFile(normalized));
+}
+
+export async function isAllowed(userId: string, username?: string): Promise<boolean> {
+  const normalizedUserId = (userId ?? '').trim();
+  const normalizedUsername = normalizeUsername(username);
+
+  const entries = await withFileLock(async () => readAllowlistFile());
+  if (!entries.length) {
+    return false;
+  }
+
+  if (entries.some((entry) => entry.type === 'wildcard')) {
     return true;
   }
-  if (tokens.some((token) => configSet.tokens.has(token))) {
+
+  if (normalizedUserId && entries.some((entry) => entry.type === 'id' && entry.value === normalizedUserId)) {
     return true;
   }
-  const store = await readAllowlist();
-  const storeTokens = new Set(store.users);
-  return tokens.some((token) => storeTokens.has(token));
-}
 
-/**
- * Check whether a group chat is allowed according to policy (config + store).
- */
-export async function isChatAllowed(
-  chatId: string,
-  overrideEntries?: string[],
-): Promise<boolean> {
-  const chatToken = buildChatMatchToken(chatId);
-  const configSet = buildChatTokenSet(overrideEntries);
-  if (configSet.wildcard) {
+  if (
+    normalizedUsername &&
+    entries.some((entry) => entry.type === 'username' && entry.value === normalizedUsername)
+  ) {
     return true;
   }
-  if (configSet.tokens.has(chatToken)) {
+
+  return false;
+}
+
+export async function addToAllowlist(entry: string | number): Promise<void> {
+  const parsedEntry = parseAllowlistInput(entry);
+
+  await withFileLock(async () => {
+    const entries = await readAllowlistFile();
+    const exists = entries.some((existing) => entriesEqual(existing, parsedEntry));
+    if (exists) {
+      return;
+    }
+
+    entries.push(parsedEntry);
+    await writeAllowlistFile(entries);
+  });
+}
+
+export async function removeFromAllowlist(entry: string | number): Promise<boolean> {
+  const parsedEntry = parseAllowlistInput(entry);
+
+  return withFileLock(async () => {
+    const entries = await readAllowlistFile();
+    const filtered = entries.filter((existing) => !entriesEqual(existing, parsedEntry));
+
+    if (filtered.length === entries.length) {
+      return false;
+    }
+
+    await writeAllowlistFile(filtered);
     return true;
+  });
+}
+
+function normalizeExistingEntry(entry: AllowlistEntry): AllowlistEntry {
+  if (!entry || typeof entry !== 'object') {
+    throw new Error('Invalid allowlist entry');
   }
-  const store = await readAllowlist();
-  const storeTokens = new Set(store.chats);
-  return storeTokens.has(chatToken);
+
+  switch (entry.type) {
+    case 'wildcard':
+      return { type: 'wildcard', value: '*' };
+    case 'username': {
+      const normalizedUsername = normalizeUsername(entry.value);
+      if (!normalizedUsername) {
+        throw new Error('Invalid username entry');
+      }
+      return { type: 'username', value: normalizedUsername };
+    }
+    case 'id': {
+      const normalizedId = normalizeId(entry.value);
+      if (!normalizedId) {
+        throw new Error('Invalid id entry');
+      }
+      return { type: 'id', value: normalizedId };
+    }
+    default:
+      throw new Error(`Unsupported entry type: ${(entry as AllowlistEntry).type}`);
+  }
 }
 
-/**
- * Persist a DM sender into the allowlist store.
- */
-export async function addUser(target: TelegramUserTarget): Promise<void> {
-  const tokens = buildUserMatchTokens(target.userId, target.username);
-  if (tokens.length === 0) return;
-  const allowlist = await readAllowlist();
-  const merged = new Set([...allowlist.users, ...tokens]);
-  allowlist.users = Array.from(merged);
-  await writeAllowlist(allowlist);
+function parseAllowlistInput(entry: string | number): AllowlistEntry {
+  if (typeof entry === 'number') {
+    if (!Number.isFinite(entry)) {
+      throw new Error('Numeric allowlist entry must be finite');
+    }
+    return { type: 'id', value: normalizeId(entry) };
+  }
+
+  const value = entry.trim();
+  if (!value) {
+    throw new Error('Allowlist entry cannot be empty');
+  }
+
+  if (value === '*') {
+    return { type: 'wildcard', value: '*' };
+  }
+
+  if (/^\d+$/.test(value)) {
+    return { type: 'id', value };
+  }
+
+  const normalizedUsername = normalizeUsername(value);
+  if (normalizedUsername) {
+    return { type: 'username', value: normalizedUsername };
+  }
+
+  throw new Error(`Invalid allowlist entry: ${entry}`);
 }
 
-/**
- * Persist a group/chat identifier into the allowlist store.
- */
-export async function addChat(chatId: string): Promise<void> {
-  const chatToken = buildChatMatchToken(chatId);
-  if (!chatToken) return;
-  const allowlist = await readAllowlist();
-  const merged = new Set([...allowlist.chats, chatToken]);
-  allowlist.chats = Array.from(merged);
-  await writeAllowlist(allowlist);
+function normalizeId(value: string | number): string {
+  const text = typeof value === 'number' ? Math.trunc(value).toString() : value.trim();
+  if (!/^\d+$/.test(text)) {
+    throw new Error('ID entries must contain only digits');
+  }
+  return text;
 }
 
-async function readAllowlist(): Promise<AllowlistData> {
-  await ensureStateDir();
+function normalizeUsername(value?: string): string | null {
+  if (!value) {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const withoutPrefix = trimmed.startsWith('@') ? trimmed.slice(1) : trimmed;
+  if (!withoutPrefix) {
+    return null;
+  }
+  return withoutPrefix.toLowerCase();
+}
+
+async function readAllowlistFile(): Promise<AllowlistEntry[]> {
   try {
     const raw = await fs.readFile(ALLOWLIST_PATH, 'utf8');
-    const parsed = JSON.parse(raw) as Partial<AllowlistData>;
-    return {
-      users: dedupeTokens(parsed.users ?? []),
-      chats: dedupeTokens(parsed.chats ?? []),
-    };
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { users: [], chats: [] };
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [];
     }
-    throw err;
+    const entries: AllowlistEntry[] = [];
+    for (const entry of parsed) {
+      try {
+        entries.push(normalizeExistingEntry(entry));
+      } catch {
+        // Skip invalid entries
+      }
+    }
+    return entries;
+  } catch (error: any) {
+    if (error && error.code === 'ENOENT') {
+      return [];
+    }
+    throw error;
   }
 }
 
-async function writeAllowlist(data: AllowlistData): Promise<void> {
-  await ensureStateDir();
-  await fs.writeFile(ALLOWLIST_PATH, JSON.stringify(data, null, 2));
+async function writeAllowlistFile(entries: AllowlistEntry[]): Promise<void> {
+  await ensureCredentialsDir();
+  const payload = `${JSON.stringify(entries, null, 2)}\n`;
+  await fs.writeFile(ALLOWLIST_PATH, payload, { mode: FILE_MODE });
+  await safeChmod(ALLOWLIST_PATH, FILE_MODE);
 }
 
-function dedupeTokens(values: unknown[]): string[] {
-  if (!Array.isArray(values)) return [];
-  const filtered = values.filter((value): value is string =>
-    typeof value === 'string' && value.trim().length > 0,
-  );
-  return Array.from(new Set(filtered));
+async function ensureCredentialsDir(): Promise<void> {
+  await fs.mkdir(CREDENTIALS_DIR, { recursive: true });
 }
 
-async function ensureStateDir(): Promise<void> {
-  await fs.mkdir(TELEGRAM_STATE_DIR, { recursive: true });
+function entriesEqual(a: AllowlistEntry, b: AllowlistEntry): boolean {
+  return a.type === b.type && a.value === b.value;
 }
 
-function buildUserTokenSet(entries?: string[]): TokenSet {
-  const set: TokenSet = { wildcard: false, tokens: new Set() };
-  for (const entry of entries ?? []) {
-    const normalized = normalizeUserAllowEntry(entry);
-    if (normalized === 'wildcard') {
-      set.wildcard = true;
-    } else if (normalized) {
-      set.tokens.add(normalized);
-    }
+async function withFileLock<T>(fn: () => Promise<T>): Promise<T> {
+  const release = await acquireLock();
+  try {
+    return await fn();
+  } finally {
+    await release();
   }
-  return set;
 }
 
-function buildChatTokenSet(entries?: string[]): TokenSet {
-  const set: TokenSet = { wildcard: false, tokens: new Set() };
-  for (const entry of entries ?? []) {
-    const normalized = normalizeChatAllowEntry(entry);
-    if (normalized === 'wildcard') {
-      set.wildcard = true;
-    } else if (normalized) {
-      set.tokens.add(normalized);
-    }
-  }
-  return set;
-}
-
-function normalizeUserAllowEntry(
-  rawValue: string,
-): string | 'wildcard' | null {
-  if (!rawValue) return null;
-  let value = stripProtocolPrefix(rawValue);
-  if (!value) return null;
-  if (value === '*') return 'wildcard';
-
-  const firstColon = value.indexOf(':');
-  if (firstColon > 0) {
-    const prefix = value.slice(0, firstColon).toLowerCase();
-    const rest = value.slice(firstColon + 1);
-    if (prefix === 'user' || prefix === 'id') {
-      const id = normalizeTelegramId(rest);
-      return id ? `id:${id}` : null;
-    }
-    if (prefix === 'username') {
-      const username = normalizeUsername(rest);
-      return username ? `username:${username}` : null;
+async function acquireLock(): Promise<() => Promise<void>> {
+  await ensureCredentialsDir();
+  const start = Date.now();
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      const handle = await fs.open(LOCK_PATH, 'wx', FILE_MODE);
+      return async () => {
+        await handle.close();
+        await fs.unlink(LOCK_PATH).catch((error: any) => {
+          if (!error || error.code !== 'ENOENT') {
+            throw error;
+          }
+        });
+      };
+    } catch (error: any) {
+      if (error && error.code === 'EEXIST') {
+        if (Date.now() - start > LOCK_TIMEOUT_MS) {
+          throw new Error('Timed out while waiting for allowlist lock');
+        }
+        await delay(LOCK_RETRY_DELAY_MS);
+        continue;
+      }
+      throw error;
     }
   }
-
-  if (value.startsWith('@')) {
-    const username = normalizeUsername(value.slice(1));
-    return username ? `username:${username}` : null;
-  }
-
-  if (/^-?\d+$/.test(value)) {
-    return `id:${normalizeTelegramId(value)}`;
-  }
-
-  const username = normalizeUsername(value);
-  return username ? `username:${username}` : null;
 }
 
-function normalizeChatAllowEntry(
-  rawValue: string,
-): string | 'wildcard' | null {
-  if (!rawValue) return null;
-  let value = stripProtocolPrefix(rawValue);
-  if (!value) return null;
-  if (value === '*') return 'wildcard';
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  const firstColon = value.indexOf(':');
-  if (firstColon > 0) {
-    const prefix = value.slice(0, firstColon).toLowerCase();
-    const rest = value.slice(firstColon + 1);
-    if (prefix === 'chat' || prefix === 'group') {
-      value = rest;
+async function safeChmod(targetPath: string, mode: number): Promise<void> {
+  try {
+    await fs.chmod(targetPath, mode);
+  } catch (error: any) {
+    if (!error || error.code !== 'ENOENT') {
+      throw error;
     }
   }
-
-  if (value.startsWith('@')) {
-    const username = normalizeUsername(value.slice(1));
-    return username ? `chat:${username}` : null;
-  }
-
-  const id = normalizeTelegramId(value);
-  return id ? `chat:${id}` : null;
-}
-
-function stripProtocolPrefix(rawValue: string): string {
-  let value = rawValue.trim();
-  while (value.toLowerCase().startsWith('telegram:')) {
-    value = value.slice(9).trim();
-  }
-  while (value.toLowerCase().startsWith('tg:')) {
-    value = value.slice(3).trim();
-  }
-  return value;
 }

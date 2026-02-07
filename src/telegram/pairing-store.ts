@@ -1,159 +1,288 @@
 import crypto from 'crypto';
-import { promises as fs } from 'fs';
+import os from 'os';
 import path from 'path';
+import type { FileHandle } from 'fs/promises';
+import * as fs from 'fs/promises';
 
-import { DATA_DIR } from '../config.js';
-import { normalizeTelegramId, normalizeUsername } from './targets.js';
+const CREDENTIALS_DIR = path.join(os.homedir(), '.nanoclaw', 'credentials');
+const STORE_FILE = path.join(CREDENTIALS_DIR, 'telegram-pairing.json');
+const LOCK_FILE = path.join(CREDENTIALS_DIR, 'telegram-pairing.lock');
 
-const TELEGRAM_STATE_DIR = path.join(DATA_DIR, 'telegram');
-const PAIRING_PATH = path.join(TELEGRAM_STATE_DIR, 'pairing.json');
-
-const PAIRING_CODE_LENGTH = 8;
-const PAIRING_TTL_MS = 60 * 60 * 1000; // 1 hour
+const CODE_CHARSET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const CODE_LENGTH = 8;
 const MAX_PENDING_PER_CHAT = 3;
+const PAIRING_TTL_MS = 60 * 60 * 1000;
+const LOCK_TIMEOUT_MS = 5000;
+const LOCK_RETRY_DELAY_MS = 50;
 
-export interface PairingRequest {
+export interface PairingEntry {
   code: string;
+  chatId: string;
   userId: string;
   username?: string;
-  chatId: string;
   createdAt: number;
   expiresAt: number;
 }
 
-interface PairingStoreData {
-  requests: PairingRequest[];
+interface PairingStoreFile {
+  pairings: PairingEntry[];
 }
 
-/**
- * Create (or refresh) a pairing request entry for a Telegram sender.
- */
-export async function upsertPairingRequest(
-  userId: string,
-  username: string | undefined,
+export async function generatePairingCode(
   chatId: string,
-): Promise<PairingRequest> {
-  const normalizedUserId = normalizeTelegramId(userId);
-  const normalizedChatId = normalizeTelegramId(chatId);
-  const normalizedUsername = normalizeUsername(username);
-  const now = Date.now();
+  userId: string,
+  username?: string,
+): Promise<string> {
+  return withLock(async () => {
+    let entries = await readStore();
+    let dirty = false;
 
-  const store = await loadPairingStore();
-  const existing = store.requests.find(
-    (request) => request.userId === normalizedUserId,
-  );
+    const pruneResult = pruneExpired(entries);
+    entries = pruneResult.entries;
+    if (pruneResult.removed) {
+      dirty = true;
+    }
 
-  if (existing) {
-    existing.username = normalizedUsername ?? existing.username;
-    existing.chatId = normalizedChatId;
-    existing.createdAt = now;
-    existing.expiresAt = now + PAIRING_TTL_MS;
-    await writePairingStore(store);
-    return existing;
-  }
+    const pendingForChat = entries.filter((entry) => entry.chatId === chatId);
+    if (pendingForChat.length >= MAX_PENDING_PER_CHAT) {
+      throw new Error(`Maximum pending pairings reached for chat ${chatId}`);
+    }
 
-  enforceChatQuota(store, normalizedChatId);
+    const now = Date.now();
+    const newEntry: PairingEntry = {
+      code: createUniqueCode(entries),
+      chatId,
+      userId,
+      username: username ?? undefined,
+      createdAt: now,
+      expiresAt: now + PAIRING_TTL_MS,
+    };
+    entries.push(newEntry);
+    dirty = true;
 
-  const newRequest: PairingRequest = {
-    code: generatePairingCode(new Set(store.requests.map((r) => r.code))),
-    userId: normalizedUserId,
-    username: normalizedUsername,
-    chatId: normalizedChatId,
-    createdAt: now,
-    expiresAt: now + PAIRING_TTL_MS,
-  };
+    if (dirty) {
+      await writeStore(entries);
+    }
 
-  store.requests.push(newRequest);
-  await writePairingStore(store);
-  return newRequest;
+    return newEntry.code;
+  });
 }
 
-async function loadPairingStore(): Promise<PairingStoreData> {
-  await ensureStateDir();
+export async function getPendingPairings(): Promise<PairingEntry[]> {
+  return withLock(async () => {
+    let entries = await readStore();
+    const pruneResult = pruneExpired(entries);
+    entries = pruneResult.entries;
+    if (pruneResult.removed) {
+      await writeStore(entries);
+    }
+    return entries;
+  });
+}
+
+export async function approvePairing(code: string): Promise<PairingEntry | null> {
+  return withLock(async () => {
+    let entries = await readStore();
+    let dirty = false;
+
+    const pruneResult = pruneExpired(entries);
+    entries = pruneResult.entries;
+    if (pruneResult.removed) {
+      dirty = true;
+    }
+
+    const index = entries.findIndex((entry) => entry.code === code.toUpperCase());
+    if (index === -1) {
+      if (dirty) {
+        await writeStore(entries);
+      }
+      return null;
+    }
+
+    const [approved] = entries.splice(index, 1);
+    dirty = true;
+    await writeStore(entries);
+    return approved;
+  });
+}
+
+export async function rejectPairing(code: string): Promise<boolean> {
+  return withLock(async () => {
+    let entries = await readStore();
+    let dirty = false;
+
+    const pruneResult = pruneExpired(entries);
+    entries = pruneResult.entries;
+    if (pruneResult.removed) {
+      dirty = true;
+    }
+
+    const index = entries.findIndex((entry) => entry.code === code.toUpperCase());
+    if (index === -1) {
+      if (dirty) {
+        await writeStore(entries);
+      }
+      return false;
+    }
+
+    entries.splice(index, 1);
+    dirty = true;
+    await writeStore(entries);
+    return true;
+  });
+}
+
+export async function cleanExpired(): Promise<void> {
+  await withLock(async () => {
+    const entries = await readStore();
+    const pruneResult = pruneExpired(entries);
+    if (pruneResult.removed) {
+      await writeStore(pruneResult.entries);
+    }
+  });
+}
+
+async function readStore(): Promise<PairingEntry[]> {
   try {
-    const raw = await fs.readFile(PAIRING_PATH, 'utf8');
-    const parsed = JSON.parse(raw) as Partial<PairingStoreData>;
-    const normalized = normalizeRequests(parsed.requests ?? []);
-    if (normalized.dirty) {
-      await writePairingStore({ requests: normalized.requests });
+    const raw = await fs.readFile(STORE_FILE, 'utf8');
+    const parsed = JSON.parse(raw) as Partial<PairingStoreFile> | PairingEntry[];
+    const candidates = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed?.pairings)
+        ? parsed.pairings
+        : [];
+
+    return candidates
+      .map(normalizeEntry)
+      .filter((entry): entry is PairingEntry => entry !== null);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return [];
     }
-    return { requests: normalized.requests };
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { requests: [] };
-    }
-    throw err;
+    throw error;
   }
 }
 
-async function writePairingStore(data: PairingStoreData): Promise<void> {
-  await ensureStateDir();
-  await fs.writeFile(PAIRING_PATH, JSON.stringify(data, null, 2));
+async function writeStore(entries: PairingEntry[]): Promise<void> {
+  await ensureStoreDir();
+  const tmpPath = `${STORE_FILE}.tmp`;
+  const payload: PairingStoreFile = { pairings: entries };
+
+  const handle = await fs.open(tmpPath, 'w', 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(payload, null, 2)}\n`);
+  } finally {
+    await handle.close();
+  }
+
+  await fs.rename(tmpPath, STORE_FILE);
+  await fs.chmod(STORE_FILE, 0o600).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+  });
 }
 
-function normalizeRequests(requests: Partial<PairingRequest>[]): {
-  dirty: boolean;
-  requests: PairingRequest[];
-} {
+function pruneExpired(entries: PairingEntry[]): { entries: PairingEntry[]; removed: boolean } {
   const now = Date.now();
-  const result: PairingRequest[] = [];
-  let dirty = false;
-  for (const req of requests) {
-    if (
-      !req ||
-      typeof req.code !== 'string' ||
-      typeof req.userId !== 'string' ||
-      typeof req.chatId !== 'string'
-    ) {
-      dirty = true;
-      continue;
-    }
-    if (typeof req.expiresAt !== 'number' || req.expiresAt <= now) {
-      dirty = true;
-      continue;
-    }
-    result.push({
-      code: req.code,
-      userId: normalizeTelegramId(req.userId),
-      username: normalizeUsername(req.username),
-      chatId: normalizeTelegramId(req.chatId),
-      createdAt: typeof req.createdAt === 'number' ? req.createdAt : now,
-      expiresAt: req.expiresAt,
-    });
-  }
-  return { dirty, requests: result };
+  const filtered = entries.filter((entry) => entry.expiresAt > now);
+  return {
+    entries: filtered,
+    removed: filtered.length !== entries.length,
+  };
 }
 
-function generatePairingCode(existingCodes: Set<string>): string {
-  const alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+function createUniqueCode(entries: PairingEntry[]): string {
+  const existing = new Set(entries.map((entry) => entry.code));
   while (true) {
-    let candidate = '';
-    for (let i = 0; i < PAIRING_CODE_LENGTH; i += 1) {
-      const index = crypto.randomInt(0, alphabet.length);
-      candidate += alphabet[index];
+    let code = '';
+    for (let i = 0; i < CODE_LENGTH; i += 1) {
+      const index = crypto.randomInt(0, CODE_CHARSET.length);
+      code += CODE_CHARSET[index];
     }
-    if (!existingCodes.has(candidate)) {
-      return candidate;
+    if (!existing.has(code)) {
+      return code;
     }
   }
 }
 
-function enforceChatQuota(store: PairingStoreData, chatId: string): void {
-  const relevant = store.requests.filter((req) => req.chatId === chatId);
-  const overflow = relevant.length - MAX_PENDING_PER_CHAT + 1;
-  if (overflow <= 0) return;
+function normalizeEntry(value: unknown): PairingEntry | null {
+  if (typeof value !== 'object' || value === null) {
+    return null;
+  }
 
-  relevant
-    .sort((a, b) => a.expiresAt - b.expiresAt)
-    .slice(0, overflow)
-    .forEach((req) => {
-      const index = store.requests.findIndex((r) => r.code === req.code);
-      if (index >= 0) {
-        store.requests.splice(index, 1);
+  const entry = value as Partial<PairingEntry>;
+  if (
+    typeof entry.code !== 'string' ||
+    typeof entry.chatId !== 'string' ||
+    typeof entry.userId !== 'string' ||
+    typeof entry.createdAt !== 'number' ||
+    typeof entry.expiresAt !== 'number'
+  ) {
+    return null;
+  }
+
+  return {
+    code: entry.code.toUpperCase(),
+    chatId: entry.chatId,
+    userId: entry.userId,
+    username: typeof entry.username === 'string' ? entry.username : undefined,
+    createdAt: entry.createdAt,
+    expiresAt: entry.expiresAt,
+  };
+}
+
+async function ensureStoreDir(): Promise<void> {
+  await fs.mkdir(CREDENTIALS_DIR, { recursive: true, mode: 0o700 });
+}
+
+async function withLock<T>(handler: () => Promise<T>): Promise<T> {
+  await ensureStoreDir();
+  const lockHandle = await acquireLock();
+  try {
+    return await handler();
+  } finally {
+    await releaseLock(lockHandle);
+  }
+}
+
+async function acquireLock(): Promise<FileHandle> {
+  const start = Date.now();
+  while (true) {
+    try {
+      return await fs.open(LOCK_FILE, 'wx', 0o600);
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code === 'EEXIST') {
+        if (Date.now() - start > LOCK_TIMEOUT_MS) {
+          throw new Error('Timed out acquiring pairing store lock');
+        }
+        await delay(LOCK_RETRY_DELAY_MS);
+        continue;
+      }
+      if (err.code === 'ENOENT') {
+        await ensureStoreDir();
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+async function releaseLock(handle: FileHandle): Promise<void> {
+  try {
+    await handle.close();
+  } finally {
+    await fs.unlink(LOCK_FILE).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') {
+        throw error;
       }
     });
+  }
 }
 
-async function ensureStateDir(): Promise<void> {
-  await fs.mkdir(TELEGRAM_STATE_DIR, { recursive: true });
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }

@@ -1,64 +1,67 @@
-export interface TelegramUserTarget {
-  userId: string;
-  username?: string;
+const TELEGRAM_PREFIXES = ["telegram:", "tg:"];
+const NUMERIC_ID_REGEX = /^-?\d+$/;
+
+type TargetType = "id" | "username";
+
+function stripPrefixes(value: string): string {
+  let candidate = value.trim();
+  if (!candidate) {
+    return "";
+  }
+
+  const lowerCandidate = candidate.toLowerCase();
+  for (const prefix of TELEGRAM_PREFIXES) {
+    if (lowerCandidate.startsWith(prefix)) {
+      candidate = candidate.slice(prefix.length).trim();
+      break;
+    }
+  }
+
+  return candidate;
 }
 
-export interface TelegramChatTarget {
-  chatId: string;
-}
-
-/**
- * Normalize a Telegram identifier (user ID or chat ID).
- */
-export function normalizeTelegramId(value: string): string {
+function extractRawTarget(target: string): string {
+  let value = stripPrefixes(target);
+  if (value.startsWith("@")) {
+    value = value.slice(1);
+  }
   return value.trim();
 }
 
-/**
- * Normalize a Telegram username for case-insensitive comparisons.
- */
-export function normalizeUsername(username?: string): string | undefined {
-  if (!username) return undefined;
-  const normalized = username.replace(/^@/, '').trim().toLowerCase();
-  return normalized || undefined;
+function isNumericValue(value: string): boolean {
+  return NUMERIC_ID_REGEX.test(value);
 }
 
-/**
- * Build the set of token keys that can match a DM sender in allowlist lookups.
- * Tokens include the numeric user ID and optional username.
- */
-export function buildUserMatchTokens(
-  userId: string,
-  username?: string,
-): string[] {
-  const tokens = new Set<string>();
-  const normalizedId = normalizeTelegramId(userId);
-  if (normalizedId) {
-    tokens.add(`id:${normalizedId}`);
+export function normalizeTarget(target: string): string {
+  const raw = extractRawTarget(target);
+  if (!raw) {
+    return "";
   }
-  const normalizedUsername = normalizeUsername(username);
-  if (normalizedUsername) {
-    tokens.add(`username:${normalizedUsername}`);
+
+  return isNumericValue(raw) ? raw : raw.toLowerCase();
+}
+
+export function isNumericId(target: string): boolean {
+  const raw = extractRawTarget(target);
+  if (!raw) {
+    return false;
   }
-  return Array.from(tokens);
+
+  return isNumericValue(raw);
 }
 
-/**
- * Build the token used to match group/chat identifiers.
- */
-export function buildChatMatchToken(chatId: string): string {
-  return `chat:${normalizeTelegramId(chatId)}`;
+export function parseTarget(target: string): { type: TargetType; value: string } {
+  const normalized = normalizeTarget(target);
+  const type: TargetType = isNumericValue(normalized) ? "id" : "username";
+
+  return { type, value: normalized };
 }
 
-/**
- * Format a friendly handle for logs or user-facing messages.
- */
-export function formatTelegramHandle(
-  userId: string,
-  username?: string,
-): string {
-  const normalizedUsername = username?.replace(/^@/, '');
-  return normalizedUsername && normalizedUsername.length > 0
-    ? `@${normalizedUsername}`
-    : userId;
+export function formatChatId(chatId: string | number, threadId?: number): string {
+  const base = typeof chatId === "number" ? chatId.toString() : normalizeTarget(chatId);
+  if (threadId === undefined) {
+    return base;
+  }
+
+  return `${base}:${threadId}`;
 }
