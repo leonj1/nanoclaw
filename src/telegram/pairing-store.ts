@@ -250,10 +250,33 @@ async function acquireLock(): Promise<FileHandle> {
   const start = Date.now();
   while (true) {
     try {
-      return await fs.open(LOCK_FILE, 'wx', 0o600);
+      const handle = await fs.open(LOCK_FILE, 'wx', 0o600);
+      try {
+        await handle.writeFile(
+          `${JSON.stringify({ pid: process.pid, createdAt: Date.now() })}\n`,
+        );
+        return handle;
+      } catch (writeError) {
+        await handle.close().catch(() => {});
+        await fs.unlink(LOCK_FILE).catch(() => {});
+        throw writeError;
+      }
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
       if (err.code === 'EEXIST') {
+        const lockOwnerPid = await readLockOwnerPid();
+        if (lockOwnerPid !== null && !isProcessRunning(lockOwnerPid)) {
+          await fs.unlink(LOCK_FILE).catch((unlinkError: NodeJS.ErrnoException) => {
+            if (
+              unlinkError.code !== 'ENOENT' &&
+              unlinkError.code !== 'EBUSY' &&
+              unlinkError.code !== 'EPERM'
+            ) {
+              throw unlinkError;
+            }
+          });
+          continue;
+        }
         if (Date.now() - start > LOCK_TIMEOUT_MS) {
           throw new Error('Timed out acquiring pairing store lock');
         }
@@ -266,6 +289,32 @@ async function acquireLock(): Promise<FileHandle> {
       }
       throw err;
     }
+  }
+}
+
+async function readLockOwnerPid(): Promise<number | null> {
+  try {
+    const raw = await fs.readFile(LOCK_FILE, 'utf8');
+    const parsed = JSON.parse(raw) as { pid?: unknown };
+    if (typeof parsed.pid === 'number' && Number.isInteger(parsed.pid) && parsed.pid > 0) {
+      return parsed.pid;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'EPERM') {
+      return true;
+    }
+    return false;
   }
 }
 
