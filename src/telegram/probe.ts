@@ -1,4 +1,5 @@
 import { Bot, GrammyError, HttpError } from 'grammy';
+import type { UserFromGetMe } from 'grammy/types';
 
 export interface BotInfo {
   id: number;
@@ -38,33 +39,16 @@ export async function probeBot(token: string): Promise<BotInfo> {
       canReadAllGroupMessages: Boolean(me.can_read_all_group_messages),
       supportsInlineQueries: Boolean(me.supports_inline_queries),
     };
-  } catch (err: unknown) {
-    if (isGrammyError(err)) {
-      if (err.error_code === 401) {
-        throw new Error('Invalid Telegram bot token (401 Unauthorized)', {
-          cause: err,
-        });
-      }
-      throw new Error(
-        `Telegram API error ${err.error_code}: ${err.description}`,
-        { cause: err },
-      );
-    }
-    if (isHttpError(err)) {
-      const detail =
-        typeof err.error === 'string'
-          ? err.error
-          : err.error instanceof Error
-            ? err.error.message
-            : 'unknown network error';
-      throw new Error(`Network error while reaching Telegram: ${detail}`, {
-        cause: err,
-      });
-    }
-    if (err instanceof Error) {
-      throw new Error('Unexpected Telegram probe failure', { cause: err });
-    }
-    throw new Error('Unknown error while contacting Telegram');
+  } catch (err) {
+    handleProbeError(err);
+  }
+}
+
+export async function probeTelegramBot(bot: Bot): Promise<UserFromGetMe> {
+  try {
+    return await bot.api.getMe();
+  } catch (err) {
+    handleProbeError(err);
   }
 }
 
@@ -91,10 +75,30 @@ export function validateBotCapabilities(info: BotInfo): ValidationResult {
   };
 }
 
-function isGrammyError(err: unknown): err is GrammyError {
-  return err instanceof GrammyError;
-}
-
-function isHttpError(err: unknown): err is HttpError {
-  return err instanceof HttpError;
+function handleProbeError(err: unknown): never {
+  if (err instanceof GrammyError) {
+    if (err.error_code === 401) {
+      throw new Error('Invalid Telegram bot token (401 Unauthorized)', {
+        cause: err,
+      });
+    }
+    throw new Error(`Telegram API error ${err.error_code}: ${err.description}`, {
+      cause: err,
+    });
+  }
+  if (err instanceof HttpError) {
+    const detail =
+      typeof err.error === 'string'
+        ? err.error
+        : err.error instanceof Error
+          ? err.error.message
+          : 'unknown network error';
+    throw new Error(`Network error while reaching Telegram: ${detail}`, {
+      cause: err,
+    });
+  }
+  if (err instanceof Error) {
+    throw new Error('Unexpected Telegram probe failure', { cause: err });
+  }
+  throw new Error('Unknown error while contacting Telegram');
 }

@@ -1,3 +1,5 @@
+import { GrammyError, HttpError } from 'grammy';
+
 export const RECOVERABLE_ERROR_CODES = [
   'ECONNRESET',
   'ECONNREFUSED',
@@ -100,6 +102,44 @@ export function getErrorCode(error: unknown): string | null {
   }
 
   return null;
+}
+
+export function isHtmlParseError(error: unknown): boolean {
+  const description = extractTelegramDescription(error);
+  if (!description) {
+    return false;
+  }
+  const normalized = description.toLowerCase();
+  return (
+    normalized.includes("can't parse entities") ||
+    normalized.includes("can't parse message text") ||
+    normalized.includes('parse_mode')
+  );
+}
+
+export function isRateLimitedError(error: unknown): boolean {
+  if (error instanceof GrammyError) {
+    return error.error_code === 429;
+  }
+  const description = extractTelegramDescription(error);
+  if (!description) {
+    return false;
+  }
+  const normalized = description.toLowerCase();
+  return normalized.includes('too many requests') || normalized.includes('retry after');
+}
+
+export function isRetryableTelegramError(error: unknown): boolean {
+  if (isRateLimitedError(error)) {
+    return true;
+  }
+  if (error instanceof HttpError) {
+    return true;
+  }
+  if (error instanceof GrammyError) {
+    return error.error_code >= 500;
+  }
+  return isRecoverableError(error);
 }
 
 function hasStatusCode(error: unknown, status: number): boolean {
@@ -220,4 +260,28 @@ function collectErrorObjects(value: unknown): Record<string, unknown>[] {
 
 function isRecord(value: unknown): value is Record<string, any> {
   return typeof value === 'object' && value !== null;
+}
+
+function extractTelegramDescription(error: unknown): string {
+  if (error instanceof GrammyError) {
+    return error.description;
+  }
+  if (error instanceof HttpError) {
+    return typeof error.error === 'string' ? error.error : error.message;
+  }
+  if (isRecord(error)) {
+    const objects = collectErrorObjects(error);
+    for (const obj of objects) {
+      for (const key of TEXT_FIELD_KEYS) {
+        const value = obj[key];
+        if (typeof value === 'string' && value.trim()) {
+          return value;
+        }
+      }
+    }
+  }
+  if (typeof error === 'string') {
+    return error;
+  }
+  return '';
 }

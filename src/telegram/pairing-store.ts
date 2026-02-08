@@ -316,10 +316,43 @@ async function acquireLock(): Promise<FileHandle> {
   const start = Date.now();
   while (true) {
     try {
-      return await fs.open(LOCK_FILE, 'wx', 0o600);
+      const handle = await fs.open(LOCK_FILE, 'wx', 0o600);
+      try {
+        await handle.writeFile(
+          `${JSON.stringify({ pid: process.pid, createdAt: Date.now() })}\n`,
+        );
+        return handle;
+      } catch (writeError) {
+        await handle.close().catch(() => {});
+        await fs.unlink(LOCK_FILE).catch(() => {});
+        throw writeError;
+      }
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
       if (err.code === 'EEXIST') {
+        const lockOwnerPid = await readLockOwnerPid();
+        const lockOwnedByDeadProcess =
+          lockOwnerPid !== null && !isProcessRunning(lockOwnerPid);
+        const lockWithoutOwnerButStale =
+          lockOwnerPid === null && (await isLockFileStale());
+
+        if (lockOwnedByDeadProcess || lockWithoutOwnerButStale) {
+          let removed = false;
+          try {
+            await fs.unlink(LOCK_FILE);
+            removed = true;
+          } catch (unlinkError) {
+            const code = (unlinkError as NodeJS.ErrnoException).code;
+            if (code === 'ENOENT') {
+              removed = true;
+            } else if (code !== 'EBUSY' && code !== 'EPERM') {
+              throw unlinkError;
+            }
+          }
+          if (removed) {
+            continue;
+          }
+        }
         if (Date.now() - start > LOCK_TIMEOUT_MS) {
           throw new Error('Timed out acquiring pairing store lock');
         }
@@ -335,20 +368,63 @@ async function acquireLock(): Promise<FileHandle> {
   }
 }
 
+async function readLockOwnerPid(): Promise<number | null> {
+  try {
+    const raw = await fs.readFile(LOCK_FILE, 'utf8');
+    const parsed = JSON.parse(raw) as { pid?: unknown };
+    if (typeof parsed.pid === 'number' && Number.isInteger(parsed.pid) && parsed.pid > 0) {
+      return parsed.pid;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'EPERM') {
+      return true;
+    }
+    return false;
+  }
+}
+
 async function releaseLock(handle: FileHandle): Promise<void> {
   try {
     await handle.close();
   } finally {
-    await fs.unlink(LOCK_FILE).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== 'ENOENT') {
-        throw error;
-      }
-    });
+    await removeLockFile();
   }
 }
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
+  });
+}
+
+async function isLockFileStale(): Promise<boolean> {
+  try {
+    const stats = await fs.stat(LOCK_FILE);
+    return Date.now() - stats.mtimeMs > LOCK_TIMEOUT_MS;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'ENOENT') {
+      return false;
+    }
+    throw err;
+  }
+}
+
+async function removeLockFile(): Promise<void> {
+  await fs.unlink(LOCK_FILE).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
   });
 }

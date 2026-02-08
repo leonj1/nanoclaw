@@ -111,8 +111,8 @@ Pairing store details:
 - TTL: 1 hour
 - Max pending per channel: 3
 - Files are stored in credentials dir:
-  - default: `~/.openclaw/credentials/telegram-pairing.json`
-  - default: `~/.openclaw/credentials/telegram-allowFrom.json`
+  - default: `~/.nanoclaw/credentials/telegram-pairing.json`
+  - default: `~/.nanoclaw/credentials/telegram-allowFrom.json`
 
 Path resolution:
 
@@ -216,4 +216,3 @@ Relevant:
    - approve with `openclaw pairing approve telegram <code>`
 4. Confirm sender entered allow store.
 5. Send test message and verify outbound response in same chat/thread.
-
