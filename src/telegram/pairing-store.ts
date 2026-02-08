@@ -265,7 +265,12 @@ async function acquireLock(): Promise<FileHandle> {
       const err = error as NodeJS.ErrnoException;
       if (err.code === 'EEXIST') {
         const lockOwnerPid = await readLockOwnerPid();
-        if (lockOwnerPid !== null && !isProcessRunning(lockOwnerPid)) {
+        const lockOwnedByDeadProcess =
+          lockOwnerPid !== null && !isProcessRunning(lockOwnerPid);
+        const lockWithoutOwnerButStale =
+          lockOwnerPid === null && (await isLockFileStale());
+
+        if (lockOwnedByDeadProcess || lockWithoutOwnerButStale) {
           await fs.unlink(LOCK_FILE).catch((unlinkError: NodeJS.ErrnoException) => {
             if (
               unlinkError.code !== 'ENOENT' &&
@@ -322,16 +327,33 @@ async function releaseLock(handle: FileHandle): Promise<void> {
   try {
     await handle.close();
   } finally {
-    await fs.unlink(LOCK_FILE).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== 'ENOENT') {
-        throw error;
-      }
-    });
+    await removeLockFile();
   }
 }
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
+  });
+}
+
+async function isLockFileStale(): Promise<boolean> {
+  try {
+    const stats = await fs.stat(LOCK_FILE);
+    return Date.now() - stats.mtimeMs > LOCK_TIMEOUT_MS;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'ENOENT') {
+      return false;
+    }
+    throw err;
+  }
+}
+
+async function removeLockFile(): Promise<void> {
+  await fs.unlink(LOCK_FILE).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
   });
 }
