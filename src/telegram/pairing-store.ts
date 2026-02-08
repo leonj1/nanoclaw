@@ -24,6 +24,27 @@ export interface PairingEntry {
   expiresAt: number;
 }
 
+export class PairingStoreError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PairingStoreError';
+  }
+}
+
+export class PairingNotFoundError extends PairingStoreError {
+  constructor(code: string) {
+    super(`Pairing code ${code} was not found.`);
+    this.name = 'PairingNotFoundError';
+  }
+}
+
+export class PairingExpiredError extends PairingStoreError {
+  constructor(public entry: PairingEntry) {
+    super(`Pairing code ${entry.code} expired at ${new Date(entry.expiresAt).toISOString()}.`);
+    this.name = 'PairingExpiredError';
+  }
+}
+
 interface PairingStoreFile {
   pairings: PairingEntry[];
 }
@@ -80,55 +101,100 @@ export async function getPendingPairings(): Promise<PairingEntry[]> {
   });
 }
 
-export async function approvePairing(code: string): Promise<PairingEntry | null> {
+export async function approvePairing(code: string): Promise<PairingEntry> {
+  const normalized = code.trim().toUpperCase();
   return withLock(async () => {
     let entries = await readStore();
     let dirty = false;
+    const now = Date.now();
 
-    const pruneResult = pruneExpired(entries);
-    entries = pruneResult.entries;
-    if (pruneResult.removed) {
+    const index = entries.findIndex((entry) => entry.code === normalized);
+    if (index !== -1) {
+      const entry = entries[index];
+      if (entry.expiresAt <= now) {
+        entries.splice(index, 1);
+        dirty = true;
+        const pruneExpiredResult = pruneExpired(entries);
+        if (pruneExpiredResult.removed) {
+          entries = pruneExpiredResult.entries;
+          dirty = true;
+        }
+        if (dirty) {
+          await writeStore(entries);
+        }
+        throw new PairingExpiredError(entry);
+      }
+
+      entries.splice(index, 1);
       dirty = true;
-    }
-
-    const index = entries.findIndex((entry) => entry.code === code.toUpperCase());
-    if (index === -1) {
+      const pruneExpiredResult = pruneExpired(entries);
+      if (pruneExpiredResult.removed) {
+        entries = pruneExpiredResult.entries;
+        dirty = true;
+      }
       if (dirty) {
         await writeStore(entries);
       }
-      return null;
+      return entry;
     }
 
-    const [approved] = entries.splice(index, 1);
-    dirty = true;
-    await writeStore(entries);
-    return approved;
+    const pruneResult = pruneExpired(entries);
+    if (pruneResult.removed) {
+      entries = pruneResult.entries;
+      dirty = true;
+    }
+
+    if (dirty) {
+      await writeStore(entries);
+    }
+
+    throw new PairingNotFoundError(code);
   });
 }
 
-export async function rejectPairing(code: string): Promise<boolean> {
+export async function rejectPairing(code: string): Promise<PairingEntry> {
+  const normalized = code.trim().toUpperCase();
   return withLock(async () => {
     let entries = await readStore();
     let dirty = false;
+    const now = Date.now();
 
-    const pruneResult = pruneExpired(entries);
-    entries = pruneResult.entries;
-    if (pruneResult.removed) {
+    const index = entries.findIndex((entry) => entry.code === normalized);
+    if (index !== -1) {
+      const entry = entries[index];
+      entries.splice(index, 1);
       dirty = true;
-    }
 
-    const index = entries.findIndex((entry) => entry.code === code.toUpperCase());
-    if (index === -1) {
+      const pruneExpiredResult = pruneExpired(entries);
+      if (pruneExpiredResult.removed) {
+        entries = pruneExpiredResult.entries;
+        dirty = true;
+      }
+
+      if (entry.expiresAt <= now) {
+        if (dirty) {
+          await writeStore(entries);
+        }
+        throw new PairingExpiredError(entry);
+      }
+
       if (dirty) {
         await writeStore(entries);
       }
-      return false;
+      return entry;
     }
 
-    entries.splice(index, 1);
-    dirty = true;
-    await writeStore(entries);
-    return true;
+    const pruneResult = pruneExpired(entries);
+    if (pruneResult.removed) {
+      entries = pruneResult.entries;
+      dirty = true;
+    }
+
+    if (dirty) {
+      await writeStore(entries);
+    }
+
+    throw new PairingNotFoundError(code);
   });
 }
 
