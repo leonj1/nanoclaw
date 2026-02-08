@@ -271,16 +271,21 @@ async function acquireLock(): Promise<FileHandle> {
           lockOwnerPid === null && (await isLockFileStale());
 
         if (lockOwnedByDeadProcess || lockWithoutOwnerButStale) {
-          await fs.unlink(LOCK_FILE).catch((unlinkError: NodeJS.ErrnoException) => {
-            if (
-              unlinkError.code !== 'ENOENT' &&
-              unlinkError.code !== 'EBUSY' &&
-              unlinkError.code !== 'EPERM'
-            ) {
+          let removed = false;
+          try {
+            await fs.unlink(LOCK_FILE);
+            removed = true;
+          } catch (unlinkError) {
+            const code = (unlinkError as NodeJS.ErrnoException).code;
+            if (code === 'ENOENT') {
+              removed = true;
+            } else if (code !== 'EBUSY' && code !== 'EPERM') {
               throw unlinkError;
             }
-          });
-          continue;
+          }
+          if (removed) {
+            continue;
+          }
         }
         if (Date.now() - start > LOCK_TIMEOUT_MS) {
           throw new Error('Timed out acquiring pairing store lock');
