@@ -38,8 +38,8 @@ export async function probeBot(token: string): Promise<BotInfo> {
       canReadAllGroupMessages: Boolean(me.can_read_all_group_messages),
       supportsInlineQueries: Boolean(me.supports_inline_queries),
     };
-  } catch (err) {
-    if (err instanceof GrammyError) {
+  } catch (err: unknown) {
+    if (isGrammyError(err)) {
       if (err.error_code === 401) {
         throw new Error('Invalid Telegram bot token (401 Unauthorized)', {
           cause: err,
@@ -50,7 +50,7 @@ export async function probeBot(token: string): Promise<BotInfo> {
         { cause: err },
       );
     }
-    if (err instanceof HttpError) {
+    if (isHttpError(err)) {
       const detail =
         typeof err.error === 'string'
           ? err.error
@@ -61,7 +61,10 @@ export async function probeBot(token: string): Promise<BotInfo> {
         cause: err,
       });
     }
-    throw err;
+    if (err instanceof Error) {
+      throw new Error('Unexpected Telegram probe failure', { cause: err });
+    }
+    throw new Error('Unknown error while contacting Telegram');
   }
 }
 
@@ -86,4 +89,12 @@ export function validateBotCapabilities(info: BotInfo): ValidationResult {
     warnings,
     errors,
   };
+}
+
+function isGrammyError(err: unknown): err is GrammyError {
+  return err instanceof GrammyError;
+}
+
+function isHttpError(err: unknown): err is HttpError {
+  return err instanceof HttpError;
 }
