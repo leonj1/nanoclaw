@@ -1,12 +1,9 @@
 import { accessSync, constants, readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 
-const TELEGRAM_TOKEN_REGEX = /^\d{5,}:[A-Za-z0-9_-]{20,}$/;
+import type { TelegramChannelConfig } from './types.js';
 
-type TokenConfig = {
-  tokenFile?: string;
-  botToken?: string;
-};
+const TELEGRAM_TOKEN_REGEX = /^\d{5,}:[A-Za-z0-9_-]{20,}$/;
 
 function validateToken(token: string, source: string): string {
   if (!TELEGRAM_TOKEN_REGEX.test(token)) {
@@ -18,7 +15,7 @@ function validateToken(token: string, source: string): string {
   return token;
 }
 
-export function resolveToken(config: TokenConfig): string {
+export function resolveTelegramToken(config: TelegramChannelConfig): string {
   const { tokenFile, botToken } = config;
 
   if (tokenFile) {

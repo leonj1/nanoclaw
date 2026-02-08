@@ -1,3 +1,5 @@
+import type { NormalizedMessage } from '../channels/types.js';
+
 export type TelegramMode = 'polling' | 'webhook';
 
 export type TelegramDmPolicy = 'pairing' | 'allowlist' | 'open' | 'disabled';
@@ -31,17 +33,44 @@ export interface AllowlistEntry {
 export interface TelegramChannelConfig {
   botToken?: string;
   tokenFile?: string;
-  mode: TelegramMode;
+  mode?: TelegramMode;
   webhookUrl?: string;
   webhookSecret?: string;
   webhookPort?: number;
-  dmPolicy: TelegramDmPolicy;
+  dmPolicy?: TelegramDmPolicy;
   allowFrom?: string[];
-  groupPolicy: TelegramGroupPolicy;
+  groupPolicy?: TelegramGroupPolicy;
   groupAllowFrom?: string[];
   requireMention?: boolean;
+  mentionKeywords?: string[];
   mediaMaxMb?: number;
   replyToMode?: TelegramReplyToMode;
   linkPreview?: boolean;
   retry?: RetryConfig;
+  runner?: {
+    concurrency?: number;
+  };
+  rateLimit?: {
+    maxRequestsPerSecond?: number;
+    maxBurst?: number;
+  };
 }
+
+export interface TelegramMessageTarget {
+  chatId: string;
+  threadId?: number;
+}
+
+export interface AccessDecision {
+  allowed: boolean;
+  reason?: string;
+}
+
+export interface AccessContext {
+  botUsername?: string;
+}
+
+export type AccessEvaluator = (
+  message: NormalizedMessage,
+  context?: AccessContext,
+) => AccessDecision;

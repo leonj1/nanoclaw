@@ -40,6 +40,14 @@ export function renderTelegramHtmlText(markdown: string): string {
   return result;
 }
 
+export function renderHtmlMessage(text: string): string {
+  return renderTelegramHtmlText(text);
+}
+
+export function escapeTelegramHtml(text: string): string {
+  return escapeHtml(text);
+}
+
 function renderCodeBlock(rawBlock: string): string {
   let content = rawBlock;
 

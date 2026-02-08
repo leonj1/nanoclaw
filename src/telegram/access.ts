@@ -1,6 +1,8 @@
+import type { NormalizedMessage } from '../channels/types.js';
 import { isAllowed as isStoredAllowlisted } from './allowlist-store.js';
 import { generatePairingCode, getPendingPairings } from './pairing-store.js';
 import { isNumericId, normalizeTarget } from './targets.js';
+import type { AccessDecision, TelegramChannelConfig } from './types.js';
 
 export type DmPolicy = 'pairing' | 'allowlist' | 'open' | 'disabled';
 export type GroupPolicy = 'open' | 'allowlist' | 'disabled';
@@ -316,4 +318,97 @@ function formatTelegramHandle(userId: string, username?: string): string {
     return `@${normalizedUsername}`;
   }
   return userId;
+}
+
+export class TelegramAccessController {
+  private readonly dmPolicy: DmPolicy;
+  private readonly groupPolicy: GroupPolicy;
+  private readonly dmAllowFrom?: string[];
+  private readonly groupAllowFrom?: string[];
+  private readonly requireMention: boolean;
+  private readonly mentionKeywords: Set<string>;
+  private botUsername?: string;
+
+  constructor(config: TelegramChannelConfig) {
+    this.dmPolicy = config.dmPolicy ?? 'open';
+    this.groupPolicy = config.groupPolicy ?? 'open';
+    this.dmAllowFrom = config.allowFrom;
+    this.groupAllowFrom = config.groupAllowFrom;
+    this.requireMention = config.requireMention ?? false;
+    this.mentionKeywords = new Set(
+      (config.mentionKeywords ?? [])
+        .map((keyword) => normalizeUsername(keyword) ?? normalizeTarget(keyword))
+        .filter((keyword): keyword is string => Boolean(keyword)),
+    );
+  }
+
+  setBotUsername(username?: string): void {
+    this.botUsername = normalizeUsername(username) ?? undefined;
+  }
+
+  evaluate(message: NormalizedMessage): AccessDecision {
+    if (message.chatType === 'private') {
+      return this.evaluateDm(message);
+    }
+    return this.evaluateGroup(message);
+  }
+
+  private evaluateDm(message: NormalizedMessage): AccessDecision {
+    switch (this.dmPolicy) {
+      case 'disabled':
+        return { allowed: false, reason: 'DMs disabled' };
+      case 'open':
+        return { allowed: true };
+      case 'allowlist':
+      case 'pairing':
+        return isUserAllowedByConfig(
+          message.senderId,
+          message.senderUsername,
+          this.dmAllowFrom,
+        )
+          ? { allowed: true }
+          : { allowed: false, reason: 'Sender not in DM allowlist' };
+      default:
+        return { allowed: false, reason: `Unknown DM policy: ${this.dmPolicy}` };
+    }
+  }
+
+  private evaluateGroup(message: NormalizedMessage): AccessDecision {
+    switch (this.groupPolicy) {
+      case 'disabled':
+        return { allowed: false, reason: 'Group messages disabled' };
+      case 'allowlist':
+        if (!isChatAllowedByConfig(message.chatId, this.groupAllowFrom)) {
+          return { allowed: false, reason: 'Group not in allowlist' };
+        }
+        break;
+      case 'open':
+        break;
+      default:
+        return {
+          allowed: false,
+          reason: `Unknown group policy: ${this.groupPolicy}`,
+        };
+    }
+
+    if (this.requireMention && !this.wasBotMentioned(message)) {
+      return { allowed: false, reason: 'Missing mention' };
+    }
+
+    return { allowed: true };
+  }
+
+  private wasBotMentioned(message: NormalizedMessage): boolean {
+    if (!message.mentions.length) {
+      return false;
+    }
+    return message.mentions.some((mention) => {
+      const normalized =
+        normalizeUsername(mention) ?? normalizeTarget(mention) ?? mention.toLowerCase();
+      if (this.botUsername && normalized === this.botUsername) {
+        return true;
+      }
+      return this.mentionKeywords.has(normalized);
+    });
+  }
 }
